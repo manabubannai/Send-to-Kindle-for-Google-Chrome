@@ -1,5 +1,7 @@
 # Send to Kindle (Reader)
 
+> 📖 **はじめての方は [SETUP.md（日本語セットアップ手順）](SETUP.md) を見てください。** 約15分・無料で設定できます。
+
 A working alternative to the official "Send to Kindle for Google Chrome" extension,
 which breaks because it depends on Amazon's authenticated web endpoints (CORB/CORS
 issues under Manifest V3, and frequent backend changes).
