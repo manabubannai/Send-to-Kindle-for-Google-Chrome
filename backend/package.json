@@ -3,5 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Vercel serverless relay that emails articles to a Kindle address via Resend."
+  "description": "Vercel serverless relay that emails articles to a Kindle address from your own Gmail (SMTP).",
+  "dependencies": {
+    "nodemailer": "^6.9.16"
+  }
 }

@@ -1,11 +1,14 @@
-// Vercel serverless function: relays an HTML article to a Kindle email as an attachment.
-// Uses Resend's REST API directly (no SDK dependency).
+// Vercel serverless function: relays an article to a Kindle email as an attachment.
+// Sends from your own Gmail via SMTP (nodemailer) — no domain / DNS verification.
 //
 // Required env vars:
-//   RESEND_API_KEY  - from https://resend.com (API Keys)
-//   SEND_FROM        - a verified sender, e.g. "Kindle <kindle@yourdomain.com>"
-//                      This exact address must be on your Amazon "Approved Personal
-//                      Document E-mail List".
+//   GMAIL_USER          - your full Gmail address (e.g. you@gmail.com).
+//                         This exact address must be on your Amazon "Approved
+//                         Personal Document E-mail List".
+//   GMAIL_APP_PASSWORD  - a 16-char Google App Password (NOT your normal password):
+//                         https://myaccount.google.com/apppasswords  (needs 2FA on).
+
+import nodemailer from "nodemailer";
 
 export default async function handler(req, res) {
   // CORS (harmless; extension requests are already allowed via host_permissions).
@@ -20,45 +23,41 @@ export default async function handler(req, res) {
     if (!to) return res.status(400).json({ error: "Missing 'to'." });
 
     // Accept either a pre-built base64 attachment (EPUB) or raw HTML (legacy).
-    let content;
+    let buffer;
     let fname;
+    let contentType;
     if (contentBase64) {
-      content = contentBase64;
+      buffer = Buffer.from(contentBase64, "base64");
       fname = filename || "article.epub";
+      contentType = mimeType || "application/epub+zip";
     } else if (html) {
-      content = Buffer.from(html, "utf-8").toString("base64");
+      buffer = Buffer.from(html, "utf-8");
       fname = filename || "article.html";
+      contentType = "text/html";
     } else {
       return res.status(400).json({ error: "Missing 'contentBase64' or 'html'." });
     }
 
-    const apiKey = process.env.RESEND_API_KEY;
-    const from = process.env.SEND_FROM;
-    if (!apiKey || !from) {
-      return res.status(500).json({ error: "Server not configured (RESEND_API_KEY / SEND_FROM)." });
+    const user = process.env.GMAIL_USER;
+    const pass = process.env.GMAIL_APP_PASSWORD;
+    if (!user || !pass) {
+      return res.status(500).json({ error: "Server not configured (GMAIL_USER / GMAIL_APP_PASSWORD)." });
     }
 
-    const attachment = { filename: fname, content };
-    if (mimeType) attachment.content_type = mimeType;
-
-    const r = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        from,
-        to: [to],
-        subject: subject || "Article",
-        text: "Sent to Kindle by the Send to Kindle (Reader) extension.",
-        attachments: [attachment],
-      }),
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: { user, pass },
     });
 
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) return res.status(502).json({ error: "Resend error", detail: data });
-    return res.status(200).json({ ok: true, id: data.id });
+    const info = await transporter.sendMail({
+      from: `Send to Kindle <${user}>`,
+      to,
+      subject: subject || "Article",
+      text: "Sent to Kindle by the Send to Kindle (Reader) extension.",
+      attachments: [{ filename: fname, content: buffer, contentType }],
+    });
+
+    return res.status(200).json({ ok: true, id: info.messageId });
   } catch (e) {
     return res.status(500).json({ error: String((e && e.message) || e) });
   }

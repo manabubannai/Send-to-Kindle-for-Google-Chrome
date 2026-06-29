@@ -31,7 +31,7 @@ Chrome tab
         ├─ Resolves lazy images → fetches bytes → embeds them
         └─ "Download HTML"  → self-contained HTML, images base64-inlined (no setup)
            "Send to Kindle" → builds EPUB w/ embedded images → POSTs to your relay
-                               → Resend emails it to @kindle.com (backend/api/send.js)
+                               → relay emails it to @kindle.com from your Gmail (backend/api/send.js)
 ```
 
 One architecture serves both **personal use today** and **distribution later**:
@@ -52,8 +52,9 @@ sender address to Amazon's approved list.
 > they can be embedded; there is no tracking or external reporting.
 
 ### 2. Stand up the relay (one-click sending)
-See [`backend/README.md`](backend/README.md): deploy to Vercel, set `RESEND_API_KEY`
-and `SEND_FROM`, and add `SEND_FROM` to your Amazon Approved Personal Document E-mail List.
+See [`backend/README.md`](backend/README.md): deploy to Vercel, set `GMAIL_USER`
+and a `GMAIL_APP_PASSWORD`, and add your Gmail address to your Amazon Approved Personal
+Document E-mail List. No domain or DNS needed — it sends from your own Gmail.
 
 ### 3. Configure & send
 Open the extension's **Options**, paste your Kindle email and the relay URL, Save.
@@ -74,7 +75,7 @@ Now **Send to Kindle** delivers in one click.
 - [x] Lazy-image resolution (`data-src`/`srcset`/`<picture>`) + embedding
 - [x] Download HTML with base64-inlined images (zero-setup, self-contained)
 - [x] EPUB output with embedded image files (sent to Kindle)
-- [x] One-click send via Vercel + Resend relay
+- [x] One-click send via Vercel + Gmail SMTP relay (no domain/DNS)
 - [ ] Toolbar icons + nicer popup
 - [ ] Multi-tab "bundle into one ebook"
 - [ ] Chrome Web Store packaging (for public distribution)
