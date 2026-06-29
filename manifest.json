@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Send to Kindle (Reader)",
+  "version": "0.1.0",
+  "description": "Extract the current article and send it to your Kindle via email relay. A working alternative to the buggy official extension.",
+  "permissions": ["activeTab", "scripting", "storage", "downloads"],
+  "host_permissions": [
+    "https://*.vercel.app/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "action": {
+    "default_title": "Send to Kindle",
+    "default_popup": "src/popup/popup.html"
+  },
+  "options_ui": {
+    "page": "src/options/options.html",
+    "open_in_tab": true
+  }
+}

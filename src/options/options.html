@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Send to Kindle — Options</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 560px; margin: 40px auto; padding: 0 16px; line-height: 1.5; }
+    h1 { font-size: 20px; }
+    label { display: block; font-weight: 600; margin: 18px 0 6px; }
+    input { width: 100%; padding: 9px 10px; font-size: 14px; border: 1px solid #ccc; border-radius: 8px; box-sizing: border-box; }
+    .hint { color: #777; font-size: 12px; margin: 4px 0 0; }
+    button { margin-top: 22px; padding: 10px 18px; font-size: 14px; border-radius: 8px; border: 1px solid #e88a00; background: #ff9900; font-weight: 600; cursor: pointer; }
+    .saved { color: #1d6b1d; font-size: 13px; margin-left: 12px; }
+    ol { color: #555; font-size: 13px; }
+    code { background: #f0f0f0; padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Send to Kindle — Options</h1>
+
+  <label for="kindleEmail">Your Send-to-Kindle email</label>
+  <input id="kindleEmail" type="email" placeholder="name_xxxx@kindle.com" autocomplete="off">
+  <p class="hint">Find it in Amazon → "Manage Your Content and Devices" → Preferences → Personal Document Settings.</p>
+
+  <label for="backendUrl">Email relay endpoint URL</label>
+  <input id="backendUrl" type="url" placeholder="https://your-app.vercel.app/api/send" autocomplete="off">
+  <p class="hint">The full URL of your deployed relay (see <code>backend/</code>). Leave empty to use "Download HTML" only.</p>
+
+  <div>
+    <button id="save">Save</button>
+    <span id="saved" class="saved" hidden>Saved ✓</span>
+  </div>
+
+  <h3>Before the first send</h3>
+  <ol>
+    <li>Deploy the relay in <code>backend/</code> to Vercel and set <code>RESEND_API_KEY</code> + <code>SEND_FROM</code>.</li>
+    <li>In Amazon Personal Document Settings, add the relay's <code>SEND_FROM</code> address to your <strong>Approved Personal Document E-mail List</strong>.</li>
+    <li>Paste your Kindle email and the relay URL above, then Save.</li>
+  </ol>
+
+  <script src="options.js"></script>
+</body>
+</html>
