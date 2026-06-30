@@ -320,27 +320,30 @@ function extForMime(mime, url) {
   return { mime: "image/jpeg", ext: "jpg" };
 }
 
-// Two image problems solved here:
+// Two image problems to solve:
 //  1) Kindle's EPUB converter can't render WebP/AVIF (shows an empty placeholder).
 //  2) Vercel caps the relay request body at ~4.5MB, so full-resolution images make
 //     large articles fail to send ("FUNCTION_PAYLOAD_TOO_LARGE" / 413).
-// So normalize every raster image: cap the longest side and re-encode to JPEG. That
-// guarantees a Kindle-renderable format AND keeps the EPUB small enough to send.
+// So we re-encode every raster image to JPEG at a capped size. For sending we shrink
+// progressively until the whole set fits a byte budget (see encodeImagesWithinBudget).
 // Uses createImageBitmap + OffscreenCanvas (both available in an MV3 service worker).
-const MAX_IMAGE_SIDE = 1600; // plenty for Kindle screens
+const MAX_IMAGE_SIDE = 1600; // default longest-side cap; plenty for Kindle screens
 const JPEG_QUALITY = 0.75;
-async function normalizeImage(bytes, mime, ext) {
-  // Leave GIFs alone (may be animated; usually small); other types get re-encoded.
-  if (/^gif$/i.test(ext)) return { bytes, mime, ext };
+// Progressive fallbacks [longest side, JPEG quality] for image-heavy articles.
+const ENCODE_LEVELS = [
+  [1600, 0.75],
+  [1200, 0.65],
+  [950, 0.55],
+  [750, 0.48],
+];
+
+// Re-encode one image to JPEG at the given size/quality. GIFs pass through untouched.
+async function encodeImage(raw, mime, ext, maxSide, quality) {
+  if (/^gif$/i.test(ext)) return { bytes: raw, mime, ext };
   try {
-    const bmp = await createImageBitmap(new Blob([bytes], { type: mime }));
-    const maxSide = Math.max(bmp.width, bmp.height);
-    // Skip re-encoding small JPEGs that are already within budget (avoids quality loss).
-    if (/^(jpg|jpeg)$/i.test(ext) && maxSide <= MAX_IMAGE_SIDE && bytes.length < 150 * 1024) {
-      bmp.close();
-      return { bytes, mime, ext };
-    }
-    const scale = Math.min(1, MAX_IMAGE_SIDE / maxSide);
+    const bmp = await createImageBitmap(new Blob([raw], { type: mime }));
+    const ms = Math.max(bmp.width, bmp.height);
+    const scale = Math.min(1, maxSide / ms);
     const w = Math.max(1, Math.round(bmp.width * scale));
     const h = Math.max(1, Math.round(bmp.height * scale));
     const canvas = new OffscreenCanvas(w, h);
@@ -349,15 +352,44 @@ async function normalizeImage(bytes, mime, ext) {
     ctx.fillRect(0, 0, w, h);
     ctx.drawImage(bmp, 0, 0, w, h);
     bmp.close();
-    const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: JPEG_QUALITY });
+    const blob = await canvas.convertToBlob({ type: "image/jpeg", quality });
     const out = new Uint8Array(await blob.arrayBuffer());
     if (out.length) return { bytes: out, mime: "image/jpeg", ext: "jpg" };
   } catch (_e) {
     /* fall through and ship the original bytes */
   }
-  return { bytes, mime, ext };
+  return { bytes: raw, mime, ext };
 }
 
+// Encode every fetched image at one level; assigns bytes/mime/ext/name on each map
+// entry and returns the total encoded image byte size.
+async function encodeImagesAtLevel(map, maxSide, quality) {
+  let total = 0;
+  let n = 0;
+  for (const info of map.values()) {
+    if (!info.ok) continue;
+    const r = await encodeImage(info.raw, info.rawMime, info.rawExt, maxSide, quality);
+    info.bytes = r.bytes;
+    info.mime = r.mime;
+    info.ext = r.ext;
+    n++;
+    info.name = `images/img${n}.${r.ext}`;
+    total += r.bytes.length;
+  }
+  return total;
+}
+
+// For sending: shrink images progressively until they fit the byte budget.
+async function encodeImagesWithinBudget(map, budgetBytes) {
+  let total = 0;
+  for (const [maxSide, quality] of ENCODE_LEVELS) {
+    total = await encodeImagesAtLevel(map, maxSide, quality);
+    if (total <= budgetBytes) break;
+  }
+  return total;
+}
+
+// Fetch raw image bytes only; encoding/resizing happens later (size-budget aware).
 async function fetchImage(url) {
   if (/^data:/i.test(url)) {
     const m = url.match(/^data:([^;,]+)?(;base64)?,(.*)$/i);
@@ -366,9 +398,8 @@ async function fetchImage(url) {
     const isB64 = !!m[2];
     try {
       const raw = isB64 ? base64ToBytes(m[3]) : enc.encode(decodeURIComponent(m[3]));
-      const { ext } = extForMime(mime, url);
-      const safe = await normalizeImage(raw, mime, ext);
-      return { url, ok: true, ...safe };
+      const { mime: rawMime, ext: rawExt } = extForMime(mime, url);
+      return { url, ok: true, raw, rawMime, rawExt };
     } catch (_e) {
       return { url, ok: false };
     }
@@ -381,9 +412,8 @@ async function fetchImage(url) {
     if (!res.ok) return { url, ok: false };
     const buf = new Uint8Array(await res.arrayBuffer());
     if (!buf.length || buf.length > 12 * 1024 * 1024) return { url, ok: false };
-    const { mime, ext } = extForMime(res.headers.get("content-type"), url);
-    const safe = await normalizeImage(buf, mime, ext);
-    return { url, ok: true, ...safe };
+    const { mime: rawMime, ext: rawExt } = extForMime(res.headers.get("content-type"), url);
+    return { url, ok: true, raw: buf, rawMime, rawExt };
   } catch (_e) {
     return { url, ok: false };
   }
@@ -393,14 +423,7 @@ async function fetchImages(urls) {
   const map = new Map();
   const list = (urls || []).slice(0, 60);
   const results = await Promise.all(list.map(fetchImage));
-  let n = 0;
-  for (const r of results) {
-    if (r.ok) {
-      n++;
-      r.name = `images/img${n}.${r.ext}`;
-    }
-    map.set(r.url, r);
-  }
+  for (const r of results) map.set(r.url, r);
   return map;
 }
 
@@ -587,6 +610,7 @@ async function handle(mode) {
   const imgNote = `${okCount} image${okCount === 1 ? "" : "s"}`;
 
   if (mode === "download") {
+    await encodeImagesAtLevel(imgMap, MAX_IMAGE_SIDE, JPEG_QUALITY);
     const html = buildSelfContainedHtml(article, imgMap);
     const filename = sanitizeFilename(article.title) + ".html";
     const dataUrl = "data:text/html;charset=utf-8," + encodeURIComponent(html);
@@ -599,8 +623,25 @@ async function handle(mode) {
     if (!kindleEmail || !backendUrl) {
       throw new Error("Set your Kindle email and backend URL in Options first.");
     }
+    // Shrink images until they fit the relay budget (base64 body must stay < ~4.5MB).
+    await encodeImagesWithinBudget(imgMap, 3.0 * 1024 * 1024);
     const { bytes, imageCount } = buildEpub(article, imgMap);
     const filename = sanitizeFilename(article.title) + ".epub";
+    const contentBase64 = bytesToBase64(bytes);
+
+    // Hard guard: Vercel rejects request bodies over ~4.5MB. If even the shrunk EPUB
+    // is too big, save it locally and tell the user to upload via Amazon (no size cap).
+    if (contentBase64.length > 4.4 * 1024 * 1024) {
+      const epubDataUrl = `data:application/epub+zip;base64,${contentBase64}`;
+      await chrome.downloads.download({ url: epubDataUrl, filename, saveAs: false });
+      const mb = Math.round((bytes.length / 1024 / 1024) * 10) / 10;
+      return {
+        ok: true,
+        title: article.title,
+        message: `Too large to email (${mb}MB). Saved ${filename} — upload it at amazon.com/sendtokindle.`,
+      };
+    }
+
     const res = await fetch(backendUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -608,7 +649,7 @@ async function handle(mode) {
         to: kindleEmail,
         subject: article.title,
         filename,
-        contentBase64: bytesToBase64(bytes),
+        contentBase64,
         mimeType: "application/epub+zip",
         sourceUrl: article.url,
       }),
