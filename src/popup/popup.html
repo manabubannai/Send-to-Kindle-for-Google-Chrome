@@ -6,12 +6,16 @@
 </head>
 <body>
   <h1>Send to Kindle</h1>
-  <p class="hint">Extracts the article on this tab.</p>
-  <div class="actions">
-    <button id="send" class="primary">Send to Kindle</button>
-    <button id="download">Download HTML</button>
-  </div>
+  <p class="hint">Opening this popup sends the article on this tab straight to your Kindle. You can close it right away — failures surface as notifications and a red badge.</p>
   <div id="status" class="status" hidden></div>
+  <button id="resend" class="primary" hidden type="button">Send again</button>
+  <div id="activity" hidden>
+    <div class="activity-head">
+      <span>Activity</span>
+      <button id="clear" class="linklike" type="button">Clear</button>
+    </div>
+    <ul id="jobs"></ul>
+  </div>
   <a id="options" href="#" class="options-link">Options</a>
   <script src="popup.js"></script>
 </body>

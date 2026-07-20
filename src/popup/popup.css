@@ -1,21 +1,22 @@
 :root { color-scheme: light dark; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  width: 280px;
+  width: 320px;
   margin: 0;
   padding: 14px;
 }
 h1 { font-size: 15px; margin: 0 0 2px; }
 .hint { font-size: 11px; color: #888; margin: 0 0 12px; }
-.actions { display: flex; flex-direction: column; gap: 8px; }
 button {
   font-size: 13px;
   padding: 9px 12px;
   border: 1px solid #d0d0d0;
   border-radius: 8px;
   background: #f5f5f5;
+  color: #1a1a1a; /* explicit: dark-scheme UA default is white-on-light here */
   cursor: pointer;
 }
+#resend { display: block; width: 100%; margin-top: 10px; }
 button:hover { background: #ececec; }
 button:disabled { opacity: 0.6; cursor: default; }
 button.primary { background: #ff9900; border-color: #e88a00; color: #1a1a1a; font-weight: 600; }
@@ -32,3 +33,81 @@ button.primary:hover { background: #f59300; }
 .status.err { background: #fbe6e6; color: #a11; }
 .status.busy { background: #eef; color: #335; }
 .options-link { display: inline-block; margin-top: 12px; font-size: 11px; color: #888; }
+
+/* -------- activity list -------- */
+#activity { margin-top: 14px; }
+.activity-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #999;
+  margin-bottom: 6px;
+}
+button.linklike {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 11px;
+  color: #888;
+  text-decoration: underline;
+  cursor: pointer;
+}
+button.linklike:hover { background: none; color: #555; }
+#jobs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.job {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 4px;
+  border-top: 1px solid rgba(128, 128, 128, 0.18);
+}
+.job-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  line-height: 16px;
+  text-align: center;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  margin-top: 1px;
+}
+.job-icon.ok { background: #188038; }
+.job-icon.warn { background: #e37400; }
+.job-icon.error { background: #d93025; }
+.job-icon.spin {
+  background: none;
+  border: 2px solid rgba(26, 115, 232, 0.25);
+  border-top-color: #1a73e8;
+  box-sizing: border-box;
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.job-body { flex: 1; min-width: 0; }
+.job-title {
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.job-msg {
+  font-size: 11px;
+  color: #888;
+  word-break: break-word;
+  margin-top: 1px;
+}
+.job.error .job-msg { color: #d93025; }
+.job.warn .job-msg { color: #b25f00; }
+.job-time { flex: none; font-size: 10px; color: #aaa; margin-top: 2px; }

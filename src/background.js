@@ -174,7 +174,335 @@ function extractInPage() {
   }
 }
 
-async function extractArticle(tabId) {
+/* ------------------------------------------------------------------ */
+/* X (Twitter) thread extractor                                        */
+/* ------------------------------------------------------------------ */
+
+// Readability can't parse X: it's a virtualized SPA with no article markup.
+// This runs in the (logged-in) tab instead: it auto-scrolls the status page,
+// harvesting the author's consecutive posts as they render — X unloads
+// offscreen tweets, so each one must be captured while it's in the DOM.
+// Returns the same shape as extractInPage so the whole downstream pipeline
+// (image fetch -> EPUB -> send) is unchanged.
+async function extractXThreadInPage() {
+  try {
+    const PAGE_URL = location.href;
+    const pm = location.pathname.match(/^\/([^/]+)\/status\/(\d+)/);
+    if (!pm) return { __error: "Not an X status page." };
+    const threadHandle = pm[1].toLowerCase();
+    const focalId = pm[2];
+
+    const esc = (t) =>
+      String(t == null ? "" : t)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const abs = (u) => {
+      try {
+        return new URL(u, PAGE_URL).href;
+      } catch (_e) {
+        return "";
+      }
+    };
+
+    // pbs.twimg.com photo URLs carry the size in ?name=; ask for the large one.
+    function upgradePhoto(u) {
+      try {
+        const url = new URL(u);
+        if (url.hostname === "pbs.twimg.com" && url.pathname.startsWith("/media/")) {
+          url.searchParams.set("name", "large");
+        }
+        return url.href;
+      } catch (_e) {
+        return u;
+      }
+    }
+
+    // Tweet text -> inline HTML: keep links, flatten styling spans, and turn
+    // emoji (X renders them as <img>) back into their alt characters.
+    function richText(node) {
+      let out = "";
+      node.childNodes.forEach((n) => {
+        if (n.nodeType === 3) {
+          out += esc(n.nodeValue).replace(/\n/g, "<br/>");
+          return;
+        }
+        if (n.nodeType !== 1) return;
+        const tag = n.tagName.toLowerCase();
+        if (tag === "img") {
+          out += esc(n.getAttribute("alt") || "");
+          return;
+        }
+        if (tag === "br") {
+          out += "<br/>";
+          return;
+        }
+        if (tag === "a") {
+          const href = abs(n.getAttribute("href") || "");
+          const inner = richText(n);
+          out += href ? `<a href="${esc(href)}">${inner}</a>` : inner;
+          return;
+        }
+        out += richText(n);
+      });
+      return out;
+    }
+
+    function authorOf(art) {
+      const link = art.querySelector('[data-testid="User-Name"] a[href^="/"]');
+      if (!link) return { handle: "", name: "" };
+      const handle = (link.getAttribute("href") || "")
+        .split(/[?#]/)[0]
+        .replace(/^\//, "")
+        .split("/")[0]
+        .toLowerCase();
+      return { handle, name: (link.textContent || "").trim() };
+    }
+
+    // Non-focal tweets link their relative timestamp to the permalink; the
+    // focal tweet may render its time without one (handled by the caller).
+    function permalinkOf(art) {
+      const t = art.querySelector("a[href*='/status/'] time");
+      if (!t) return { id: "", href: "", datetime: "" };
+      const a = t.closest("a");
+      const href = abs(a.getAttribute("href") || "");
+      const m = href.match(/\/status\/(\d+)/);
+      return { id: m ? m[1] : "", href, datetime: t.getAttribute("datetime") || "" };
+    }
+
+    // A quoted tweet is a nested clickable card with its own author header.
+    function quoteRootOf(art) {
+      for (const d of art.querySelectorAll('div[role="link"]')) {
+        if (d.querySelector('[data-testid="User-Name"]')) return d;
+      }
+      return null;
+    }
+
+    // Photos + video posters inside `scope`, excluding the quote subtree.
+    function mediaOf(scope, excludeRoot) {
+      const outside = (el) => !excludeRoot || !excludeRoot.contains(el);
+      const imgs = [];
+      scope
+        .querySelectorAll('[data-testid="tweetPhoto"] img, [data-testid^="card."] img')
+        .forEach((img) => {
+          if (!outside(img)) return;
+          let src = img.currentSrc || img.getAttribute("src") || "";
+          if (!/^https?:\/\/pbs\.twimg\.com\//.test(src)) return;
+          if (/\/profile_images\//.test(src)) return;
+          src = upgradePhoto(src);
+          if (!imgs.some((i) => i.src === src)) imgs.push({ src, alt: img.getAttribute("alt") || "" });
+        });
+      const posters = [];
+      scope.querySelectorAll("video[poster]").forEach((v) => {
+        if (!outside(v)) return;
+        const p = abs(v.getAttribute("poster") || "");
+        if (p && !posters.includes(p)) posters.push(p);
+      });
+      return { imgs, posters };
+    }
+
+    function textOf(art, excludeRoot) {
+      for (const el of art.querySelectorAll('[data-testid="tweetText"]')) {
+        if (!excludeRoot || !excludeRoot.contains(el)) return el;
+      }
+      return null;
+    }
+
+    const collected = new Map(); // status id -> record
+    let cutoffTop = Infinity; // doc offset where a stranger's reply ended the thread
+
+    // One pass over the currently rendered tweets (visual order, since the
+    // virtualized list positions items with transforms, not DOM order).
+    function harvest() {
+      const arts = [...document.querySelectorAll('article[data-testid="tweet"]')]
+        .map((a) => ({ a, top: a.getBoundingClientRect().top + window.scrollY }))
+        .sort((x, y) => x.top - y.top);
+      let ended = false;
+      let lastOwnTop = -Infinity;
+      for (const v of collected.values()) if (v.top > lastOwnTop) lastOwnTop = v.top;
+
+      for (const { a: art, top } of arts) {
+        const author = authorOf(art);
+        if (!author.handle) continue;
+        if (author.handle !== threadHandle) {
+          // First reply by someone else below the author's posts = thread end.
+          if (top > lastOwnTop && lastOwnTop !== -Infinity) {
+            ended = true;
+            if (top < cutoffTop) cutoffTop = top;
+          }
+          continue;
+        }
+        const perma = permalinkOf(art);
+        // The focal tweet may lack a permalink anchor; it's the page's own id.
+        const id = perma.id || (!collected.has(focalId) ? focalId : "");
+        if (!id || collected.has(id)) {
+          if (id) collected.get(id).top = top; // layout above may have grown
+          continue;
+        }
+        if (collected.size >= 200) return true; // runaway guard
+
+        const quoteRoot = quoteRootOf(art);
+        const textEl = textOf(art, quoteRoot);
+        const media = mediaOf(art, quoteRoot);
+        let quote = null;
+        if (quoteRoot) {
+          const qAuthor = authorOf(quoteRoot);
+          const qText = textOf(quoteRoot, null);
+          const qMedia = mediaOf(quoteRoot, null);
+          quote = {
+            author: qAuthor.name || qAuthor.handle,
+            text: qText ? richText(qText) : "",
+            imgs: qMedia.imgs,
+            posters: qMedia.posters,
+          };
+        }
+        let datetime = perma.datetime;
+        if (!datetime) {
+          const t = art.querySelector("time");
+          if (t) datetime = t.getAttribute("datetime") || "";
+        }
+        collected.set(id, {
+          id,
+          top,
+          name: author.name,
+          text: textEl ? richText(textEl) : "",
+          plain: textEl ? (textEl.textContent || "").trim() : "",
+          lang: (textEl && textEl.getAttribute("lang")) || "",
+          imgs: media.imgs,
+          posters: media.posters,
+          quote,
+          datetime,
+          permalink: perma.href || PAGE_URL,
+        });
+        if (top > lastOwnTop) lastOwnTop = top;
+      }
+      return ended;
+    }
+
+    // Scroll from the top through the thread, harvesting as tweets render.
+    const startY = window.scrollY;
+    window.scrollTo(0, 0);
+    await sleep(700);
+    const deadline = Date.now() + 35000;
+    let lastHeight = 0;
+    let stableAtBottom = 0;
+    let timedOut = true;
+    for (let step = 0; step < 120 && Date.now() < deadline; step++) {
+      const ended = harvest();
+      if (ended && collected.has(focalId)) {
+        timedOut = false;
+        break;
+      }
+      const doc = document.documentElement;
+      if (window.innerHeight + window.scrollY >= doc.scrollHeight - 50) {
+        if (doc.scrollHeight === lastHeight) {
+          if (++stableAtBottom >= 3) {
+            timedOut = false;
+            break;
+          }
+        } else {
+          stableAtBottom = 0;
+        }
+        lastHeight = doc.scrollHeight;
+      }
+      window.scrollBy(0, Math.round(window.innerHeight * 0.85));
+      await sleep(600);
+    }
+    harvest();
+    window.scrollTo(0, startY);
+
+    // Order chronologically (snowflake ids are time-ordered) and drop any of
+    // the author's deeper replies harvested past the thread's end.
+    const tweets = [...collected.values()]
+      .filter((t) => t.top < cutoffTop)
+      .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+    if (!tweets.length) {
+      return {
+        __error:
+          "No posts found on this X page. Make sure you're logged in and the post is visible, then try again.",
+      };
+    }
+
+    const displayName = tweets[0].name || "@" + threadHandle;
+    const byline = `${displayName} (@${threadHandle})`;
+
+    const images = [];
+    const addImg = (src) => {
+      if (src && !images.includes(src)) images.push(src);
+    };
+    const figure = (src, alt) => {
+      addImg(src);
+      return `<figure><img src="${esc(src)}" alt="${esc(alt)}"/></figure>`;
+    };
+
+    const n = tweets.length;
+    const sections = tweets.map((t, i) => {
+      let s = '<div class="tweet">';
+      if (t.text) s += `<p>${t.text}</p>`;
+      t.imgs.forEach((im) => (s += figure(im.src, im.alt)));
+      t.posters.forEach((p) => {
+        addImg(p);
+        s += `<figure><img src="${esc(p)}" alt="video"/><figcaption>Video — watch on X</figcaption></figure>`;
+      });
+      if (t.quote) {
+        s += "<blockquote>";
+        if (t.quote.author) s += `<p class="byline">${esc(t.quote.author)}</p>`;
+        if (t.quote.text) s += `<p>${t.quote.text}</p>`;
+        t.quote.imgs.forEach((im) => (s += figure(im.src, im.alt)));
+        t.quote.posters.forEach((p) => {
+          addImg(p);
+          s += `<figure><img src="${esc(p)}" alt="video"/><figcaption>Video — watch on X</figcaption></figure>`;
+        });
+        s += "</blockquote>";
+      }
+      let when = "";
+      if (t.datetime) {
+        const d = new Date(t.datetime);
+        if (!isNaN(d)) when = d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+      }
+      s += `<p class="tweet-meta">${i + 1}/${n}${
+        when ? ` · <a href="${esc(t.permalink)}">${esc(when)}</a>` : ""
+      }</p>`;
+      s += "</div>";
+      return s;
+    });
+    let content = sections.join("<hr/>");
+    if (timedOut) {
+      content +=
+        '<hr/><p class="tweet-meta">Note: the thread may be truncated — extraction hit its time limit before reaching the end.</p>';
+    }
+
+    const excerpt = (tweets[0].plain || "").replace(/\s+/g, " ").trim();
+    const title =
+      (excerpt ? excerpt.slice(0, 70) + (excerpt.length > 70 ? "…" : "") : `Thread by @${threadHandle}`) +
+      (n > 1 ? ` (thread, ${n} posts)` : "");
+
+    return {
+      title,
+      byline,
+      siteName: "X (Twitter)",
+      lang: (tweets[0].lang || "en").slice(0, 8) || "en",
+      url: PAGE_URL,
+      content,
+      images,
+    };
+  } catch (e) {
+    return { __error: String(e) };
+  }
+}
+
+const X_STATUS_RE = /^https?:\/\/(?:mobile\.)?(?:x|twitter)\.com\/[^/]+\/status\/\d+/i;
+
+async function extractArticle(tabId, url) {
+  if (X_STATUS_RE.test(url || "")) {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: extractXThreadInPage,
+    });
+    return result;
+  }
   await chrome.scripting.executeScript({
     target: { tabId },
     files: ["src/vendor/Readability.js"],
@@ -335,6 +663,8 @@ const ENCODE_LEVELS = [
   [1200, 0.65],
   [950, 0.55],
   [750, 0.48],
+  [600, 0.45],
+  [500, 0.4],
 ];
 
 // Re-encode one image to JPEG at the given size/quality. GIFs pass through untouched.
@@ -380,13 +710,26 @@ async function encodeImagesAtLevel(map, maxSide, quality) {
 }
 
 // For sending: shrink images progressively until they fit the byte budget.
+// If even the smallest level is over budget, drop the largest images until it
+// fits: an article with a few photos missing beats the whole send failing over
+// to a local file the user has to upload by hand.
 async function encodeImagesWithinBudget(map, budgetBytes) {
   let total = 0;
   for (const [maxSide, quality] of ENCODE_LEVELS) {
     total = await encodeImagesAtLevel(map, maxSide, quality);
-    if (total <= budgetBytes) break;
+    if (total <= budgetBytes) return { total, dropped: 0 };
   }
-  return total;
+  const bySize = [...map.values()]
+    .filter((i) => i.ok)
+    .sort((a, b) => b.bytes.length - a.bytes.length);
+  let dropped = 0;
+  for (const info of bySize) {
+    if (total <= budgetBytes) break;
+    info.ok = false; // rewriteImgs/buildEpub treat it like a failed fetch
+    total -= info.bytes.length;
+    dropped++;
+  }
+  return { total, dropped };
 }
 
 // Fetch raw image bytes only; encoding/resizing happens later (size-budget aware).
@@ -436,7 +779,9 @@ const CSS =
   "h1{font-size:1.6em;line-height:1.25}img{max-width:100%;height:auto}figure{margin:1em 0}" +
   "figcaption{color:#666;font-size:.85em}blockquote{border-left:3px solid #ccc;margin:1em 0;padding-left:1em;color:#444}" +
   "pre{white-space:pre-wrap;word-wrap:break-word}.byline{color:#555;font-style:italic;margin-top:0}" +
-  ".source{color:#777;font-size:.85em;margin-top:2em;border-top:1px solid #ddd;padding-top:.6em}";
+  ".source{color:#777;font-size:.85em;margin-top:2em;border-top:1px solid #ddd;padding-top:.6em}" +
+  "hr{border:none;border-top:1px solid #ddd;margin:1.4em 0}" +
+  ".tweet-meta{color:#888;font-size:.8em;margin-top:.4em}";
 
 function escapeHtml(s) {
   return String(s)
@@ -573,6 +918,312 @@ ${manifestItems.join("\n")}
 }
 
 /* ------------------------------------------------------------------ */
+/* Job tracking: storage.session registry + badge + notifications      */
+/* ------------------------------------------------------------------ */
+
+// Sends are tracked as jobs that outlive the popup: the popup only enqueues,
+// then the worker extracts/builds/sends and records progress in
+// chrome.storage.session. Failures surface three ways so batch sends from many
+// tabs can't fail silently: an OS notification (click = jump to the tab), a red
+// count on the toolbar badge that persists until reviewed, and the popup's
+// activity list.
+
+const MAX_JOBS = 30;
+const BADGE_COLOR = { error: "#d93025", running: "#1a73e8", ok: "#188038" };
+
+// All read-modify-write cycles on the job list go through one promise chain:
+// concurrent jobs finish in any order, and parallel get/set pairs on
+// storage.session would drop updates. Side effects that must happen in commit
+// order (keepalive/watchdog flips) run inside the fn, in-turn.
+let jobsChain = Promise.resolve();
+function withJobs(fn) {
+  const next = jobsChain.then(async () => {
+    const { jobs = [] } = await chrome.storage.session.get("jobs");
+    const out = fn(jobs) || jobs;
+    // Cap history without ever evicting a running job: updateJob writes, the
+    // batch-drained check, the reaper, dedupe, and notification click-through
+    // all require in-flight jobs to stay in storage (a 31+ tab batch would
+    // otherwise silently lose its oldest send).
+    let finished = 0;
+    const capped = out.filter((j) => j.status === "running" || ++finished <= MAX_JOBS);
+    await chrome.storage.session.set({ jobs: capped });
+    return capped;
+  });
+  jobsChain = next.catch(() => {}); // keep the chain usable after a failure
+  return next;
+}
+
+async function updateJob(id, patch) {
+  const jobs = await withJobs((jobs) => {
+    const j = jobs.find((j) => j.id === id);
+    if (j) Object.assign(j, patch);
+    return jobs;
+  });
+  await refreshBadge(jobs);
+  return jobs;
+}
+
+const isProblem = (j) => j.status === "error" || j.status === "warn";
+
+let clearBadgeTimer = null;
+
+async function setBadge(text, color) {
+  await chrome.action.setBadgeText({ text });
+  if (text) {
+    await chrome.action.setBadgeBackgroundColor({ color });
+    if (chrome.action.setBadgeTextColor) {
+      await chrome.action.setBadgeTextColor({ color: "#ffffff" });
+    }
+  }
+}
+
+// Unseen failures (red) win over in-flight count (blue); otherwise clear.
+// The transient green ✓ after an all-ok batch is set directly by runJob.
+async function refreshBadge(jobs) {
+  if (!jobs) jobs = (await chrome.storage.session.get("jobs")).jobs || [];
+  if (clearBadgeTimer) {
+    clearTimeout(clearBadgeTimer);
+    clearBadgeTimer = null;
+  }
+  const unseen = jobs.filter((j) => isProblem(j) && !j.seen).length;
+  const running = jobs.filter((j) => j.status === "running").length;
+  if (unseen > 0) await setBadge(String(unseen), BADGE_COLOR.error);
+  else if (running > 0) await setBadge(String(running), BADGE_COLOR.running);
+  else await setBadge("", BADGE_COLOR.ok);
+}
+
+function notify(id, title, message, { sticky = false } = {}) {
+  try {
+    chrome.notifications.create(id, {
+      type: "basic",
+      iconUrl: chrome.runtime.getURL("icons/icon128.png"),
+      title,
+      message,
+      priority: 2,
+      requireInteraction: sticky,
+    });
+  } catch (_e) {
+    /* notifications may be blocked at the OS level; badge still shows it */
+  }
+}
+
+// Clicking a job notification acknowledges the failure (clears its share of
+// the red badge) and jumps to the tab it came from.
+chrome.notifications.onClicked.addListener(async (nid) => {
+  chrome.notifications.clear(nid);
+  if (!nid.startsWith("job-")) return;
+  const id = nid.slice("job-".length);
+  const jobs = await updateJob(id, { seen: true }); // also recomputes the badge
+  const job = jobs.find((j) => j.id === id);
+  if (!job || !job.tabId) return;
+  try {
+    const tab = await chrome.tabs.get(job.tabId);
+    await chrome.tabs.update(job.tabId, { active: true });
+    await chrome.windows.update(tab.windowId, { focused: true });
+  } catch (_e) {
+    /* tab was closed since */
+  }
+});
+
+// MV3 idle-kills the worker after ~30s without extension API activity; a long
+// backend POST could cross that line. Any API call resets the timer, so tick
+// one while jobs are in flight.
+let keepaliveTimer = null;
+function setKeepalive(on) {
+  if (on && !keepaliveTimer) {
+    keepaliveTimer = setInterval(() => chrome.runtime.getPlatformInfo(() => {}), 20000);
+  } else if (!on && keepaliveTimer) {
+    clearInterval(keepaliveTimer);
+    keepaliveTimer = null;
+  }
+}
+
+// Batch bookkeeping for the "all N sent" summary + green ✓. In-memory only:
+// if the worker dies mid-batch there is simply no summary — per-job failure
+// notifications (the critical path) come from storage, not from this.
+let batch = { ok: 0, problems: 0 };
+
+// Number of runJob() calls alive in THIS worker instance. If an alarm fires
+// and this is 0 but storage still has "running" jobs, the worker that owned
+// them was killed — surface those as interrupted instead of spinning forever.
+let activeRuns = 0;
+
+const WATCHDOG = "job-watchdog";
+
+let jobSeq = 0;
+const newJobId = () =>
+  Date.now().toString(36) + "-" + ++jobSeq + "-" + Math.random().toString(36).slice(2, 6);
+
+async function enqueueJob(mode, tab) {
+  const job = {
+    id: newJobId(),
+    mode,
+    tabId: tab.id,
+    title: tab.title || tab.url || "Untitled",
+    url: tab.url || "",
+    status: "running",
+    message: "Queued…",
+    startedAt: Date.now(),
+    seen: false,
+  };
+  let existing = null;
+  const jobs = await withJobs((jobs) => {
+    existing = jobs.find((j) => j.status === "running" && j.tabId === tab.id && j.mode === mode);
+    if (existing) return jobs; // double-click guard: this tab is already in flight
+    if (!jobs.some((j) => j.status === "running")) batch = { ok: 0, problems: 0 };
+    jobs.unshift(job);
+    // In-turn: a completion turn racing this enqueue would otherwise flip
+    // keepalive/watchdog off AFTER we flipped them on.
+    setKeepalive(true);
+    chrome.alarms.create(WATCHDOG, { periodInMinutes: 1 });
+    return jobs;
+  });
+  if (existing) return existing.id;
+  await refreshBadge(jobs);
+  runJob(job, mode, tab); // deliberately not awaited: the popup returns immediately
+  return job.id;
+}
+
+async function runJob(job, mode, tab) {
+  // activeRuns stays high until the final status is WRITTEN, so the watchdog
+  // can never observe "no active runs" while this job still looks running.
+  activeRuns++;
+  let jobs;
+  let result;
+  let anyRunning = true;
+  let anyUnseenProblem = false;
+  let batchSnap = { ok: 0, problems: 0 };
+  try {
+    const progress = (message) => {
+      updateJob(job.id, { message }).catch(() => {});
+    };
+    try {
+      result = await handle(mode, tab, progress);
+    } catch (e) {
+      let message = String((e && e.message) || e);
+      if (/no tab with id|tab was closed|frame .*removed/i.test(message)) {
+        message = "The tab was closed before the article could be read.";
+      }
+      result = { ok: false, message };
+    }
+    const status = result.ok ? (result.warn ? "warn" : "ok") : "error";
+    result.status = status;
+    // One serialized turn writes the final status, updates the batch counters,
+    // and decides whether the batch just drained. A racing enqueue chains
+    // after this turn, so the keepalive/watchdog flips happen in commit order
+    // and the "all done" verdict can't be based on a stale snapshot.
+    jobs = await withJobs((jobs) => {
+      const j = jobs.find((x) => x.id === job.id);
+      if (j) {
+        Object.assign(j, {
+          status,
+          message: result.message,
+          title: result.title || job.title,
+          finishedAt: Date.now(),
+        });
+      }
+      if (status === "ok") batch.ok++;
+      else batch.problems++;
+      anyRunning = jobs.some((x) => x.status === "running");
+      anyUnseenProblem = jobs.some((x) => isProblem(x) && !x.seen);
+      batchSnap = { ...batch };
+      if (!anyRunning) {
+        setKeepalive(false);
+        chrome.alarms.clear(WATCHDOG);
+      }
+      return jobs;
+    });
+  } finally {
+    activeRuns--;
+  }
+  await refreshBadge(jobs);
+
+  const status = result.status;
+  const title = result.title || job.title;
+  if (status === "error") {
+    notify("job-" + job.id, "Send to Kindle failed", `${title}\n${result.message}`, { sticky: true });
+  } else if (status === "warn") {
+    notify("job-" + job.id, "Send to Kindle — action needed", `${title}\n${result.message}`, { sticky: true });
+  }
+
+  if (!anyRunning && batchSnap.problems === 0 && batchSnap.ok > 0 && !anyUnseenProblem) {
+    if (batchSnap.ok > 1) {
+      notify("batch-" + job.id, "Sent to Kindle", `All ${batchSnap.ok} articles sent successfully.`);
+    }
+    await setBadge("✓", BADGE_COLOR.ok); // transient; cleared below
+    clearBadgeTimer = setTimeout(() => refreshBadge().catch(() => {}), 8000);
+  }
+}
+
+async function markSeen() {
+  const jobs = await withJobs((jobs) => {
+    jobs.forEach((j) => {
+      if (j.status !== "running") j.seen = true;
+    });
+    return jobs;
+  });
+  await refreshBadge(jobs);
+}
+
+async function clearHistory() {
+  const jobs = await withJobs((jobs) => jobs.filter((j) => j.status === "running"));
+  chrome.notifications.getAll((all) => {
+    for (const id of Object.keys(all || {})) {
+      if (id.startsWith("job-") || id.startsWith("batch-")) chrome.notifications.clear(id);
+    }
+  });
+  await refreshBadge(jobs);
+}
+
+// Jobs still marked "running" in storage that this worker instance doesn't own
+// are dead (their worker was killed) — surface them instead of leaving them
+// spinning forever. `minAgeMs` guards the watchdog against reaping a job that
+// was enqueued moments ago but whose runJob hasn't been observed yet.
+async function reapInterruptedJobs(minAgeMs = 0, clearAlarmIfIdle = false) {
+  const cutoff = Date.now() - minAgeMs;
+  let reaped = 0;
+  const jobs = await withJobs((jobs) => {
+    jobs.forEach((j) => {
+      if (j.status === "running" && j.startedAt <= cutoff) {
+        j.status = "error";
+        j.message = "Interrupted — Chrome suspended the extension mid-send. Please retry.";
+        j.finishedAt = Date.now();
+        j.seen = false;
+        reaped++;
+      }
+    });
+    // In-turn like the other flips: never undo what a racing enqueue just set
+    // up for its own job. Keepalive must also drop here, or a job orphaned by
+    // a failed storage write would pin this worker alive forever.
+    if (!jobs.some((j) => j.status === "running")) {
+      setKeepalive(false);
+      if (clearAlarmIfIdle) chrome.alarms.clear(WATCHDOG);
+    }
+    return jobs;
+  });
+  await refreshBadge(jobs);
+  if (reaped > 0) {
+    notify(
+      "reaped-" + Date.now(),
+      "Send to Kindle interrupted",
+      `${reaped} send${reaped === 1 ? " was" : "s were"} interrupted before finishing. Open the extension to see which, then retry.`,
+      { sticky: true }
+    );
+  }
+  return jobs;
+}
+reapInterruptedJobs();
+
+// Watchdog: fires every minute while jobs are (supposedly) in flight. If this
+// worker owns no active runs, whatever storage says is "running" is orphaned —
+// the alarm both wakes a fresh worker after a kill and cleans up here.
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== WATCHDOG) return;
+  if (activeRuns > 0) return; // jobs genuinely alive in this instance
+  await reapInterruptedJobs(60 * 1000, true);
+});
+
+/* ------------------------------------------------------------------ */
 /* Orchestration                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -594,22 +1245,26 @@ function isBlockedUrl(url) {
   return false;
 }
 
-async function handle(mode) {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+async function handle(mode, tab, progress = () => {}) {
   if (!tab || !tab.id) throw new Error("No active tab.");
   if (isBlockedUrl(tab.url)) {
     throw new Error("This page can't be read by extensions. Open a normal article page.");
   }
 
-  const article = await extractArticle(tab.id);
+  const isXThread = X_STATUS_RE.test(tab.url || "");
+  progress(isXThread ? "Reading X thread (auto-scrolling)…" : "Extracting article…");
+  const article = await extractArticle(tab.id, tab.url);
   if (!article) throw new Error("Couldn't find article content on this page.");
   if (article.__error) throw new Error("Extractor error: " + article.__error);
 
+  const nImgs = (article.images || []).length;
+  progress(nImgs ? `Fetching ${nImgs} image${nImgs === 1 ? "" : "s"}…` : "Preparing…");
   const imgMap = await fetchImages(article.images);
   const okCount = [...imgMap.values()].filter((i) => i.ok).length;
   const imgNote = `${okCount} image${okCount === 1 ? "" : "s"}`;
 
   if (mode === "download") {
+    progress("Building HTML…");
     await encodeImagesAtLevel(imgMap, MAX_IMAGE_SIDE, JPEG_QUALITY);
     const html = buildSelfContainedHtml(article, imgMap);
     const filename = sanitizeFilename(article.title) + ".html";
@@ -624,7 +1279,9 @@ async function handle(mode) {
       throw new Error("Set your Kindle email and backend URL in Options first.");
     }
     // Shrink images until they fit the relay budget (base64 body must stay < ~4.5MB).
-    await encodeImagesWithinBudget(imgMap, 3.0 * 1024 * 1024);
+    progress("Building EPUB…");
+    // 2.8MB images + article text keeps the base64 body safely under ~4.4MB.
+    const { dropped } = await encodeImagesWithinBudget(imgMap, 2.8 * 1024 * 1024);
     const { bytes, imageCount } = buildEpub(article, imgMap);
     const filename = sanitizeFilename(article.title) + ".epub";
     const contentBase64 = bytesToBase64(bytes);
@@ -637,33 +1294,101 @@ async function handle(mode) {
       const mb = Math.round((bytes.length / 1024 / 1024) * 10) / 10;
       return {
         ok: true,
+        warn: true,
         title: article.title,
         message: `Too large to email (${mb}MB). Saved ${filename} — upload it at amazon.com/sendtokindle.`,
       };
     }
 
-    const res = await fetch(backendUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        to: kindleEmail,
-        subject: article.title,
-        filename,
-        contentBase64,
-        mimeType: "application/epub+zip",
-        sourceUrl: article.url,
-      }),
-    });
+    progress("Sending to Kindle…");
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 90000);
+    let res;
+    try {
+      res = await fetch(backendUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          to: kindleEmail,
+          subject: article.title,
+          filename,
+          contentBase64,
+          mimeType: "application/epub+zip",
+          sourceUrl: article.url,
+        }),
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      throw new Error(
+        ctrl.signal.aborted
+          ? "Send timed out after 90s — backend unreachable?"
+          : "Network error contacting backend: " + String((e && e.message) || e)
+      );
+    } finally {
+      clearTimeout(to);
+    }
     const text = await res.text();
     if (!res.ok) throw new Error("Backend " + res.status + ": " + text.slice(0, 300));
-    return { ok: true, title: article.title, message: `Sent to ${kindleEmail} (${imageCount} embedded)` };
+    const droppedNote = dropped
+      ? `, ${dropped} large image${dropped === 1 ? "" : "s"} skipped to fit the size limit`
+      : "";
+    return {
+      ok: true,
+      title: article.title,
+      message: `Sent to ${kindleEmail} (${imageCount} embedded${droppedNote})`,
+    };
   }
 
   throw new Error("Unknown mode: " + mode);
 }
 
+/* ------------------------------------------------------------------ */
+/* Messages from the popup                                             */
+/* ------------------------------------------------------------------ */
+
+// enqueue: validate what the user can fix right now (blocked page, missing
+// options) and answer immediately so the popup can show it inline; everything
+// slower runs as a tracked job and reports via badge/notifications/history.
+async function onMessage(msg) {
+  if (!msg || typeof msg !== "object") throw new Error("Bad message.");
+
+  if (msg.type === "enqueue") {
+    const { mode, tab } = msg;
+    if (!tab || !tab.id) throw new Error("No active tab.");
+    if (isBlockedUrl(tab.url)) {
+      throw new Error("This page can't be read by extensions. Open a normal article page.");
+    }
+    if (mode === "send") {
+      const { kindleEmail, backendUrl } = await chrome.storage.sync.get(["kindleEmail", "backendUrl"]);
+      if (!kindleEmail || !backendUrl) {
+        throw new Error("Set your Kindle email and backend URL in Options first.");
+      }
+    }
+    const jobId = await enqueueJob(mode, tab);
+    return { ok: true, jobId };
+  }
+
+  if (msg.type === "markSeen") {
+    await markSeen();
+    return { ok: true };
+  }
+
+  // Sent by the popup on open purely to wake this worker so the cold-start
+  // reaper can flag any orphaned "running" jobs right away.
+  if (msg.type === "wake") {
+    return { ok: true };
+  }
+
+  if (msg.type === "clearHistory") {
+    await clearHistory();
+    return { ok: true };
+  }
+
+  throw new Error("Unknown message type: " + msg.type);
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  handle(msg && msg.mode)
+  onMessage(msg)
     .then(sendResponse)
     .catch((e) => sendResponse({ ok: false, message: String((e && e.message) || e) }));
   return true; // keep the message channel open for the async response

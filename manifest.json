@@ -1,16 +1,28 @@
 {
   "manifest_version": 3,
   "name": "Send to Kindle (Reader)",
-  "version": "0.2.3",
+  "version": "0.5.0",
   "description": "Extract the current article (images embedded) and send it to your Kindle as a self-contained EPUB. A working alternative to the buggy official extension.",
-  "permissions": ["activeTab", "scripting", "storage", "downloads"],
+  "permissions": ["activeTab", "scripting", "storage", "downloads", "notifications", "alarms"],
   "host_permissions": ["*://*/*"],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "background": {
     "service_worker": "src/background.js"
   },
   "action": {
-    "default_title": "Send to Kindle",
-    "default_popup": "src/popup/popup.html"
+    "default_title": "Send this page to Kindle",
+    "default_popup": "src/popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
   "options_ui": {
     "page": "src/options/options.html",

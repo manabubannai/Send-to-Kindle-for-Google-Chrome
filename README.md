@@ -28,13 +28,36 @@ The EPUB is built by a tiny dependency-free store-only ZIP writer (no JSZip).
 
 ```
 Chrome tab
-  └─ Extension (MV3): popup button
+  └─ Extension (MV3): one tap on the toolbar icon
         ├─ Readability extracts the article  (src/vendor/Readability.js + src/background.js)
         ├─ Resolves lazy images → fetches bytes → embeds them
-        └─ "Download HTML"  → self-contained HTML, images base64-inlined (no setup)
-           "Send to Kindle" → builds EPUB w/ embedded images → POSTs to your relay
-                               → relay emails it to @kindle.com from your Gmail (backend/api/send.js)
+        └─ builds EPUB w/ embedded images → POSTs to your relay
+           → relay emails it to @kindle.com from your Gmail (backend/api/send.js)
 ```
+
+### One-tap batch sending & error visibility
+
+**Opening the popup IS the send**: the moment you tap the toolbar icon, the current
+tab is queued as a **background job** — close the popup immediately, open the next
+tab, tap again. Two guards prevent accidental sends when you only meant to check
+history: a page already sent in the last 3 minutes, or unreviewed failures (red
+badge), switch the popup to view mode with an explicit send button. You can't miss
+a failure:
+
+- **OS notification** on every failed send (and on "file too large, saved locally —
+  upload manually"). Clicking the notification jumps back to the offending tab.
+- **Toolbar badge**: blue count while sends are in flight, **red count of failures**
+  that stays until you open the popup and see them, green ✓ when a batch finishes clean.
+- **Activity list in the popup**: live status (extracting / fetching images / sending)
+  and the last 30 results with error reasons.
+- A batch that finishes with no failures shows one "All N articles sent" notification
+  instead of per-article noise.
+- A watchdog alarm catches the rare case where Chrome kills the service worker
+  mid-send: within a minute the orphaned job is flagged "Interrupted" and notified,
+  instead of spinning forever.
+
+Jobs are also bound to the tab you clicked from, so switching tabs mid-send can never
+extract the wrong page.
 
 One architecture serves both **personal use today** and **distribution later**:
 other users never need OAuth — they just enter their Kindle email and add your relay's
@@ -45,9 +68,8 @@ sender address to Amazon's approved list.
 ### 1. Load the extension
 1. Open `chrome://extensions`, enable **Developer mode** (top right).
 2. Click **Load unpacked** and select this folder (`send-to-kindle/`).
-3. Pin it. Open any article and click the toolbar icon → **Download HTML**.
-4. Open that file locally — images should display (they're embedded), not show broken `?` boxes.
-   This validates extraction quality before wiring up automatic sending.
+3. Pin it. Once Options are configured (steps below), opening any article and
+   tapping the icon sends it — no further clicks.
 
 > On load, Chrome will warn that the extension can "read your data on all websites".
 > That broad host permission is only used to **fetch article images** from any site so
@@ -77,11 +99,17 @@ Now **Send to Kindle** delivers in one click.
 - [x] Lazy-image resolution (`data-src`/`srcset`/`<picture>`) + embedding
 - [x] Transcode WebP/AVIF → JPEG (Kindle's EPUB converter can't render WebP)
 - [x] Resize/recompress images (cap 1600px, JPEG q0.75) to stay under Vercel's 4.5MB relay limit
-- [x] Image-heavy articles: shrink progressively to a byte budget, then fall back to a local EPUB download (upload via Amazon) if still too big
-- [x] Download HTML with base64-inlined images (zero-setup, self-contained)
+- [x] Image-heavy articles: shrink progressively to a byte budget, then drop the largest images to fit; the local-EPUB-download fallback (upload via Amazon) remains only as a last resort
 - [x] EPUB output with embedded image files (sent to Kindle)
 - [x] One-click send via Vercel + Gmail SMTP relay (no domain/DNS)
-- [ ] Toolbar icons + nicer popup
+- [x] Background jobs: popup-independent sends, OS notifications on failure, badge counts, activity history (batch-safe)
+- [x] Toolbar icons + nicer popup
+- [x] One-tap send: opening the popup auto-sends the current tab (Download HTML UI removed in 0.4.0; the code path remains in background.js)
+- [x] X (Twitter) threads: on a `x.com/*/status/*` page, a dedicated extractor auto-scrolls
+  the thread (the timeline is virtualized, so offscreen tweets leave the DOM), collects the
+  author's consecutive posts — text, photos upgraded to `name=large`, quoted tweets, video
+  thumbnails — and sends them as one numbered EPUB. Runs in your logged-in tab, so no X API
+  is needed. Stops at the first reply by someone else.
 - [ ] Multi-tab "bundle into one ebook"
 - [ ] Chrome Web Store packaging (for public distribution)
 
