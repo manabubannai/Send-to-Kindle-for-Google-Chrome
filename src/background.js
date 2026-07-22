@@ -310,6 +310,144 @@ async function extractXThreadInPage() {
       return null;
     }
 
+    // X "Articles" (long-form posts) live at a /status/ URL too, but render a
+    // rich-text document instead of tweets: there is no [data-testid="tweetText"]
+    // anywhere, so the thread harvester below would ship an empty book. Walk the
+    // article's own block list instead.
+    async function extractArticleDoc(root) {
+      const bodyRoot = root.querySelector('[data-testid="longformRichTextComponent"]');
+      if (!bodyRoot) return { __error: "This X Article has no readable body yet. Reload the page and try again." };
+      // The component wraps every block in a single positioning div.
+      const holder =
+        bodyRoot.children.length === 1 && bodyRoot.children[0].children.length > 1
+          ? bodyRoot.children[0]
+          : bodyRoot;
+      const blocks = [...holder.children];
+
+      const isMedia = (u) => /^https?:\/\/pbs\.twimg\.com\/media\//.test(u || "");
+      // Article images mount only while on screen and unmount once scrolled past,
+      // so record each block's image during the scroll pass, not at the end.
+      const media = new Map(); // block index -> {src, alt, video}
+      let cover = "";
+      function noteMedia() {
+        blocks.forEach((b, i) => {
+          if (media.has(i)) return;
+          for (const im of b.querySelectorAll("img")) {
+            const src = im.currentSrc || im.getAttribute("src") || "";
+            if (!isMedia(src)) continue;
+            media.set(i, { src: upgradePhoto(src), alt: im.getAttribute("alt") || "" });
+            return;
+          }
+          const v = b.querySelector("video[poster]");
+          if (v) media.set(i, { src: abs(v.getAttribute("poster")), alt: "video", video: true });
+        });
+        if (!cover) {
+          for (const im of root.querySelectorAll("img")) {
+            if (bodyRoot.contains(im)) continue;
+            const src = im.currentSrc || im.getAttribute("src") || "";
+            if (isMedia(src)) {
+              cover = upgradePhoto(src);
+              break;
+            }
+          }
+        }
+      }
+
+      const startY = window.scrollY;
+      window.scrollTo(0, 0);
+      await sleep(600);
+      noteMedia();
+      const deadline = Date.now() + 30000;
+      let lastHeight = 0;
+      let stableAtBottom = 0;
+      for (let step = 0; step < 120 && Date.now() < deadline; step++) {
+        const doc = document.documentElement;
+        if (window.innerHeight + window.scrollY >= doc.scrollHeight - 50) {
+          if (doc.scrollHeight === lastHeight) {
+            if (++stableAtBottom >= 2) break;
+          } else {
+            stableAtBottom = 0;
+          }
+          lastHeight = doc.scrollHeight;
+        }
+        window.scrollBy(0, Math.round(window.innerHeight * 0.85));
+        await sleep(400);
+        noteMedia();
+      }
+      window.scrollTo(0, startY);
+
+      const images = [];
+      const addFigure = (src, alt, caption) => {
+        if (!src) return "";
+        if (!images.includes(src)) images.push(src);
+        return (
+          `<figure><img src="${esc(src)}" alt="${esc(alt || "")}"/>` +
+          (caption ? `<figcaption>${esc(caption)}</figcaption>` : "") +
+          "</figure>"
+        );
+      };
+
+      let content = cover ? addFigure(cover, "") : "";
+      blocks.forEach((b, i) => {
+        const m = media.get(i);
+        if (m) {
+          content += addFigure(m.src, m.alt, m.video ? "Video — watch on X" : "");
+          return;
+        }
+        const h = b.querySelector("h1,h2,h3,h4,h5,h6");
+        if (h) {
+          // h1 is the article title, which we emit separately from `title`.
+          const level = Math.min(3, Math.max(2, Number(h.tagName[1])));
+          const inner = richText(h);
+          if (inner.trim()) content += `<h${level}>${inner}</h${level}>`;
+          return;
+        }
+        const list = b.matches("ul,ol") ? b : b.querySelector("ul,ol");
+        if (list) {
+          const tag = list.tagName.toLowerCase();
+          const items = [...list.querySelectorAll("li")]
+            .map((li) => richText(li))
+            .filter((t) => t.trim())
+            .map((t) => `<li>${t}</li>`)
+            .join("");
+          if (items) content += `<${tag}>${items}</${tag}>`;
+          return;
+        }
+        // Embed blocks whose media never mounted hold a bare anchor and no text;
+        // judge emptiness by text, not by the markup richText() emits.
+        if (!(b.textContent || "").trim()) return;
+        const inner = richText(b);
+        const cls = typeof b.className === "string" ? b.className : "";
+        content += /longform-blockquote/.test(cls)
+          ? `<blockquote><p>${inner}</p></blockquote>`
+          : `<p>${inner}</p>`;
+      });
+
+      if (!content) {
+        return {
+          __error:
+            "Couldn't read this X Article. Make sure you're logged in and the article is visible, then try again.",
+        };
+      }
+
+      const titleEl = root.querySelector('[data-testid="twitter-article-title"]');
+      const author = authorOf(document);
+      const displayName = author.name || "@" + threadHandle;
+      const langEl = bodyRoot.querySelector("[lang]");
+      return {
+        title: (titleEl ? titleEl.textContent.trim() : "") || `Article by @${threadHandle}`,
+        byline: `${displayName} (@${threadHandle})`,
+        siteName: "X (Twitter)",
+        lang: ((langEl && langEl.getAttribute("lang")) || "en").slice(0, 8) || "en",
+        url: PAGE_URL,
+        content,
+        images,
+      };
+    }
+
+    const articleRoot = document.querySelector('[data-testid="twitterArticleReadView"]');
+    if (articleRoot) return await extractArticleDoc(articleRoot);
+
     const collected = new Map(); // status id -> record
     let cutoffTop = Infinity; // doc offset where a stranger's reply ended the thread
 
